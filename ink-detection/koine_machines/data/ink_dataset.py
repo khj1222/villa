@@ -150,6 +150,61 @@ def _flat_z_window_bbox(
     return (z0 + offset, y0, x0, z1 + offset, y1, x1), offset
 
 
+def _local_wander_settings(config, *, do_augmentations: bool, is_validation: bool):
+    """Return (max_amplitude, corr_px_range) when the local Z wander applies to this patch, else None."""
+    cfg = config.get("flat_z_local_wander") or {}
+    if not bool(cfg.get("enabled", False)) or not do_augmentations or is_validation:
+        return None
+    probability = float(cfg.get("probability", 1.0))
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError(f"flat_z_local_wander.probability must be in [0, 1], got {probability}")
+    if random.random() >= probability:
+        return None
+    max_amplitude = float(cfg.get("max_amplitude", 2.0))
+    corr = cfg.get("corr_px", [64, 256])
+    corr_range = (float(corr[0]), float(corr[1]))
+    if max_amplitude < 0 or corr_range[0] <= 0 or corr_range[1] < corr_range[0]:
+        raise ValueError(f"invalid flat_z_local_wander settings: {cfg!r}")
+    return max_amplitude, corr_range
+
+
+def _smooth_field(shape, *, corr_px: float, rng) -> np.ndarray:
+    """A smooth random field on `shape` (Y, X) with roughly `corr_px` between independent values, peak |1|."""
+    grid = (max(2, int(round(shape[0] / corr_px)) + 1), max(2, int(round(shape[1] / corr_px)) + 1))
+    coarse = rng.standard_normal(grid)
+    field = ndimage.zoom(coarse, (shape[0] / grid[0], shape[1] / grid[1]), order=1, grid_mode=True,
+                         mode="nearest")
+    field = field[: shape[0], : shape[1]]
+    peak = float(np.abs(field).max())
+    return field / peak if peak > 0 else field
+
+
+def _apply_local_wander(full_crop, *, window_depth: int, window_offset: int, max_amplitude: float,
+                        corr_range, rng) -> np.ndarray:
+    """Resample a (D, Y, X) crop to a `window_depth` window whose depth varies smoothly in Y/X.
+
+    The window starts at the canonical centred position plus `window_offset` (the existing whole-window
+    jitter) plus a smooth field of peak |amplitude| <= `max_amplitude` slices; the total shift is clipped to
+    the real layers on either side, so no padding is ever sampled. Linear interpolation along Z.
+    """
+    depth = int(full_crop.shape[0])
+    trim = (depth - int(window_depth)) // 2
+    amplitude = float(rng.uniform(0.0, max_amplitude))
+    corr_px = float(rng.uniform(corr_range[0], corr_range[1]))
+    field = _smooth_field(full_crop.shape[1:], corr_px=corr_px, rng=rng) * amplitude
+    shift = np.clip(window_offset + field, -trim, trim).astype(np.float32)
+    pos = trim + np.arange(window_depth, dtype=np.float32)[:, None, None] + shift[None]
+    pos = np.clip(pos, 0, depth - 1)
+    lo = np.floor(pos).astype(np.int64)
+    hi = np.minimum(lo + 1, depth - 1)
+    weight = pos - lo
+    full = full_crop.astype(np.float32, copy=False)
+    out = np.take_along_axis(full, lo, 0) * (1.0 - weight) + np.take_along_axis(full, hi, 0) * weight
+    if np.issubdtype(full_crop.dtype, np.floating):
+        return out.astype(full_crop.dtype)
+    return np.rint(out).astype(full_crop.dtype)
+
+
 def _require_z_bbox_inside(array, bbox, *, name: str) -> None:
     z0, y0, x0, z1, y1, x1 = (int(value) for value in bbox)
     shape = tuple(int(value) for value in array.shape)
@@ -1965,6 +2020,23 @@ class InkDataset(Dataset):
                 if require_real_z:
                     _require_z_bbox_inside(image_vol, flat_bbox, name="image")
                 image_crop, image_valid_slices = _read_bbox_with_padding(image_vol, flat_bbox, fill_value=0)
+                wander = _local_wander_settings(
+                    self.config,
+                    do_augmentations=self.do_augmentations,
+                    is_validation=patch.is_validation,
+                )
+                if wander is not None:
+                    full_bbox = tuple(int(value) for value in patch.bbox)
+                    _require_z_bbox_inside(image_vol, full_bbox, name="image")
+                    full_crop, _ = _read_bbox_with_padding(image_vol, full_bbox, fill_value=0)
+                    image_crop = _apply_local_wander(
+                        full_crop,
+                        window_depth=int(image_crop.shape[0]),
+                        window_offset=int(_z_window_offset),
+                        max_amplitude=wander[0],
+                        corr_range=wander[1],
+                        rng=np.random.default_rng(random.getrandbits(32)),
+                    )
                 if getattr(patch, 'is_unlabeled', False):
                     supervision_crop = np.zeros(expected_shape, dtype=np.uint8)
                     inklabels_crop = np.zeros(expected_shape, dtype=np.uint8)
