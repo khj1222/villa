@@ -6,6 +6,7 @@
 #include <QString>
 
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -23,13 +24,15 @@ class InkDetectionOverlayController : public ViewerOverlayControllerBase
     Q_OBJECT
 
 public:
-    // A published ink detection image of the active surface: its file in the
-    // surface's artifact directory (downloaded when first selected).
+    // An ink detection image of the active surface: a published file in the
+    // surface's artifact directory (downloaded when first selected), or one of
+    // the surface's own `ink` / `ink_*` store channels.
     struct Option {
         QString label;
         std::string name;  // the published file (vc::objects::CatalogFile::name)
-        std::string url;   // where it is published
-        std::filesystem::path localPath; // its copy in VC3D's remote cache
+        std::string url;   // where it is published, empty for a channel
+        std::filesystem::path localPath;  // its copy in VC3D's remote cache; for a channel, a key that names no file
+        std::string channel;  // the surface channel, empty for a published file
     };
 
     explicit InkDetectionOverlayController(CState* state, QObject* parent = nullptr);
@@ -82,6 +85,7 @@ private:
     QImage renderSingleChannelImage(const cv::Mat_<uint8_t>& scalar,
                                     const std::string& colormapId) const;
     void refreshOptionsForActiveSurface();
+    std::shared_ptr<QuadSurface> activeSurface() const;
     std::string activeSegmentKey() const;
     bool imageMatchesSurface(const QuadSurface& surface) const;
 

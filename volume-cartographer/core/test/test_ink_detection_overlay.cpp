@@ -21,6 +21,8 @@
 #include <QImage>
 #include <QThread>
 
+#include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/imgcodecs.hpp>
@@ -274,6 +276,108 @@ TEST_CASE("ink detection overlay flips the displayed image")
     CHECK(!overlay.horizontalFlip());
     CHECK(qRed(overlay.selectedImageForTesting().pixel(0, 0)) == 40);
     CHECK(qRed(overlay.selectedImageForTesting().pixel(2, 1)) == 30);
+}
+
+TEST_CASE("ink detection options include the surface's ink channels")
+{
+    int argc = 0;
+    QCoreApplication app(argc, nullptr);
+    CState state;
+    auto surface = makeSurface("segment");
+    // Ink at two pixels per grid step, as `vc_object_ingest --surface-channel` stores it.
+    cv::Mat_<uint8_t> ink(6, 6, uint8_t(0));
+    ink(0, 0) = 200;
+    ink(5, 5) = 50;
+    surface->setChannel("ink_model_b", ink);
+    surface->setChannel("ink", cv::Mat_<uint8_t>(3, 3, uint8_t(9)));
+    surface->setChannel("generations", cv::Mat_<uint16_t>(3, 3, uint16_t(7)));
+    surface->setChannel("inked", cv::Mat_<uint8_t>(3, 3, uint8_t(1)));
+    state.setSurface("segmentation", surface, false, false);
+
+    InkDetectionOverlayController overlay(&state);
+    overlay.refreshAvailableDetections();
+    REQUIRE(overlay.options().size() == 2);
+    CHECK(overlay.options()[0].channel == "ink");
+    CHECK(overlay.options()[1].channel == "ink_model_b");
+    CHECK(overlay.options()[1].label == "ink_model_b");
+    CHECK(!fs::exists(overlay.options()[1].localPath));
+
+    overlay.setSelectedPath(overlay.options()[1].localPath);
+    REQUIRE(overlay.hasLoadedSelection());
+    CHECK(overlay.selectedIsSingleChannel());
+    const QImage& image = overlay.selectedImageForTesting();
+    CHECK(image.width() == 6);
+    CHECK(image.height() == 6);
+    CHECK(qRed(image.pixel(0, 0)) == 200);
+    CHECK(qRed(image.pixel(5, 5)) == 50);
+    CHECK(qAlpha(image.pixel(1, 1)) == 0);
+
+    // Another surface has none of them.
+    state.setSurface("segmentation", makeSurface("other"), false, false);
+    CHECK(overlay.options().empty());
+    CHECK(!overlay.hasLoadedSelection());
+}
+
+TEST_CASE("ink detection overlay reads an ink channel from the object store")
+{
+    namespace vo = vc::objects;
+    int argc = 0;
+    QCoreApplication app(argc, nullptr);
+    const auto root = tempRoot("store_channel");
+    auto session = std::make_shared<vo::ObjectStoreSession>();
+    vo::OpenOptions options;
+    options.author = "ink-test";
+    { auto created = vo::ObjectStore::create(root / "objects.vcobj", options); }
+    const auto attachment = session->attach(root / "objects.vcobj", options);
+
+    cv::Mat_<cv::Vec3f> points(3, 3);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) points(r, c) = {float(c), float(r), 10.f};
+    QuadSurface source(points, {1.0f, 1.0f});
+    cv::Mat_<uint8_t> ink(6, 6);
+    for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) ink(r, c) = uint8_t(10 * r + c);
+    source.setChannel("ink", ink);
+    const auto uuid = vo::util::newUuid();
+    {
+        vo::ObjectRecord record;
+        record.uuid = uuid;
+        record.kind = "surface";
+        record.name = "segment";
+        auto request = session->newRequest(attachment);
+        request.expectedObjects = {{uuid, std::nullopt}};
+        request.operations.push_back(vo::CreateObjectOp{vo::objectRecordJson(record)});
+        request.operations.push_back(vo::PutGeometryOp{uuid, quad_surface_geometry(source), {}});
+        session->submit(attachment, request);
+    }
+
+    std::shared_ptr<QuadSurface> loaded;
+    std::string revision;
+    session->readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
+        loaded = load_quad_from_store(reader, uuid);
+        revision = reader.currentGeometry(uuid)->uuid;
+    });
+    loaded->setChannelLoader(store_channel_loader(session, attachment, revision));
+    REQUIRE(!loaded->channelLoaded("ink"));
+
+    CState state;
+    state.setSurface("segmentation", loaded, false, false);
+    InkDetectionOverlayController overlay(&state);
+    overlay.refreshAvailableDetections();
+    REQUIRE(overlay.options().size() == 1);
+    overlay.setSelectedPath(overlay.options().front().localPath);
+    REQUIRE(overlay.hasLoadedSelection());
+    const QImage& image = overlay.selectedImageForTesting();
+    CHECK(image.width() == 6);
+    CHECK(image.height() == 6);
+    CHECK(qRed(image.pixel(3, 2)) == 23);
+    CHECK(qRed(image.pixel(5, 5)) == 55);
+
+    state.setSurface("segmentation", nullptr, false, false);
+    loaded.reset();
+    session.reset();
+    std::error_code ec;
+    fs::remove_all(root, ec);
 }
 
 TEST_CASE("Project stores are peers with independent persistent per-kind selections")

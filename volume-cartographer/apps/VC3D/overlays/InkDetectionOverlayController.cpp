@@ -339,6 +339,17 @@ void InkDetectionOverlayController::refreshOptionsForActiveSurface()
             next.clear();
         }
     }
+    // Ink maps stored on the surface itself, e.g. by
+    // `vc_object_ingest --surface-channel UUID ink prediction.tif`.
+    if (const auto surface = activeSurface(); surface && surface->id == nextSegmentKey) {
+        std::vector<std::string> channels;
+        for (const auto& name : surface->channelNames())
+            if (name == "ink" || name.rfind("ink_", 0) == 0)
+                channels.push_back(name);
+        std::sort(channels.begin(), channels.end());
+        for (const auto& name : channels)
+            next.push_back({QString::fromStdString(name), {}, {}, "surface-channel:" + name, name});
+    }
 
     std::filesystem::path nextSelectedPath;
     if (const auto savedIt = _selectedPathBySegment.find(nextSegmentKey);
@@ -371,12 +382,14 @@ void InkDetectionOverlayController::refreshOptionsForActiveSurface()
     refreshAll();
 }
 
+std::shared_ptr<QuadSurface> InkDetectionOverlayController::activeSurface() const
+{
+    return _state ? std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation")) : nullptr;
+}
+
 std::string InkDetectionOverlayController::activeSegmentKey() const
 {
-    if (!_state) {
-        return {};
-    }
-    auto surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+    auto surface = activeSurface();
     return surface ? surface->id : std::string{};
 }
 
@@ -386,12 +399,20 @@ void InkDetectionOverlayController::loadSelectedImage()
         return;
     }
 
+    const auto option = std::find_if(_options.begin(), _options.end(), [&](const Option& candidate) {
+        return candidate.localPath == _selectedPath;
+    });
+    cv::Mat src;
     std::error_code ec;
-    if (!std::filesystem::is_regular_file(_selectedPath, ec)) {
+    if (option != _options.end() && !option->channel.empty()) {
+        // A store channel is read from the surface's geometry revision on first use.
+        const auto surface = activeSurface();
+        if (!surface || surface->id != _selectedSegmentKey) {
+            return;
+        }
+        src = surface->channel(option->channel, SURF_CHANNEL_NORESIZE);
+    } else if (!std::filesystem::is_regular_file(_selectedPath, ec)) {
         // Published images are downloaded into the published-file cache when first shown.
-        const auto option = std::find_if(_options.begin(), _options.end(), [&](const Option& candidate) {
-            return candidate.localPath == _selectedPath;
-        });
         if (option == _options.end() || _fetchingPath == _selectedPath) {
             return;
         }
@@ -409,12 +430,12 @@ void InkDetectionOverlayController::loadSelectedImage()
                 }
             });
         return;
-    }
-    // TIFF, PNG or JPEG by suffix, in OpenCV's colour order; a palette PNG stays indices.
-    cv::Mat src;
-    try {
-        src = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(_selectedPath).string(), 0));
-    } catch (const std::exception&) {
+    } else {
+        // TIFF, PNG or JPEG by suffix, in OpenCV's colour order; a palette PNG stays indices.
+        try {
+            src = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(_selectedPath).string(), 0));
+        } catch (const std::exception&) {
+        }
     }
     if (src.empty()) {
         return;
